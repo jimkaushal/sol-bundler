@@ -10,7 +10,10 @@ import {
 } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
 import { wallet, connection, payer } from "../config";
-import * as spl from "@solana/spl-token";
+import {
+  TOKEN_PROGRAM_ID,
+  createCloseAccountInstruction,
+} from "@solana/spl-token";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
 import promptSync from "prompt-sync";
@@ -125,25 +128,51 @@ function chunkArray<T>(array: T[], chunkSize: number): T[][] {
 
 async function createAndSignVersionedTxWithKeypairs(
   instructionsChunk: TransactionInstruction[],
-  blockhash: Blockhash | string
-): Promise<VersionedTransaction> {
-  const lut = new PublicKey(poolInfo.addressLUT.toString());
-  const lookupTableAccount = (await connection.getAddressLookupTable(lut))
-    .value;
-
-  if (lookupTableAccount == null) {
-    console.log("Lookup table account not found!");
-    process.exit(0);
+  blockhash: Blockhash | string,
+  extraSigners: Keypair[] = []
+): Promise<VersionedTransaction | null> {
+  if (instructionsChunk.length === 0) {
+    console.log("Skipping empty transaction batch.");
+    return null;
   }
+
+  let lookupTableAccount = null;
+  if (poolInfo.addressLUT) {
+    const lut = new PublicKey(poolInfo.addressLUT.toString());
+    lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+    if (!lookupTableAccount) {
+      console.log(
+        "Warning: Lookup table account not found, continuing without LUT."
+      );
+    }
+  }
+
+  console.log("Creating transaction with instructions:", instructionsChunk);
 
   const message = new TransactionMessage({
     payerKey: payer.publicKey,
     recentBlockhash: blockhash,
     instructions: instructionsChunk,
-  }).compileToV0Message([lookupTableAccount]);
+  }).compileToV0Message(lookupTableAccount ? [lookupTableAccount] : []);
 
   const versionedTx = new VersionedTransaction(message);
-  versionedTx.sign([payer]);
+  // Sign with both the payer and any extra signers (i.e. buyer wallets)
+  versionedTx.sign([payer, ...extraSigners]);
+
+  // Optionally simulate before returning
+  try {
+    const simulationResult = await connection.simulateTransaction(versionedTx);
+    if (simulationResult.value.err) {
+      console.error(
+        "Transaction simulation failed:",
+        simulationResult.value.err
+      );
+      return null;
+    }
+  } catch (err) {
+    console.error("Simulation error:", err);
+    return null;
+  }
 
   return versionedTx;
 }
@@ -160,7 +189,9 @@ async function processInstructionsSOL(
       chunk,
       blockhash
     );
-    txns.push(versionedTx);
+    if (versionedTx) {
+      txns.push(versionedTx);
+    }
   }
 
   return txns;
@@ -193,78 +224,122 @@ async function generateATAandSOL() {
 async function createReturns() {
   const txsSigned: VersionedTransaction[] = [];
   const keypairs = loadKeypairs();
-  const chunkedKeypairs = chunkArray(keypairs, 7); // EDIT CHUNKS?
+  const chunkedKeypairs = chunkArray(keypairs, 7);
 
   const jitoTipIn = prompt("Jito tip in Sol (Ex. 0.01): ");
   const TipAmt = parseFloat(jitoTipIn) * LAMPORTS_PER_SOL;
 
   const { blockhash } = await connection.getLatestBlockhash();
 
-  // Iterate over each chunk of keypairs
-  for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
-    const chunk = chunkedKeypairs[chunkIndex];
+  for (const chunk of chunkedKeypairs) {
     const instructionsForChunk: TransactionInstruction[] = [];
+    const extraSigners: Keypair[] = []; // Collect buyer wallets that are spending funds
 
-    // Iterate over each keypair in the chunk to create swap instructions
-    for (let i = 0; i < chunk.length; i++) {
-      const keypair = chunk[i];
+    for (const keypair of chunk) {
+      console.log(`Processing keypair: ${keypair.publicKey.toString()}`);
+
+      let balance = 0;
+      let retryCount = 0;
+      let success = false;
+
+      while (retryCount < 10 && !success) {
+        try {
+          balance = await connection.getBalance(keypair.publicKey);
+          success = true;
+        } catch (error) {
+          console.warn(
+            `Rate limited (429), retrying in ${500 * 2 ** retryCount}ms...`
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, 500 * 2 ** retryCount)
+          );
+          retryCount++;
+        }
+      }
+
+      if (!success) {
+        console.error(
+          `Failed to fetch balance for ${keypair.publicKey.toString()} after retries.`
+        );
+        continue;
+      }
+
+      if (balance === 0) {
+        console.log(
+          `Skipping keypair ${keypair.publicKey.toString()} because it has no SOL.`
+        );
+        continue;
+      }
+
       console.log(
-        `Processing keypair ${i + 1}/${chunk.length}:`,
-        keypair.publicKey.toString()
+        `Transferring ${
+          balance / LAMPORTS_PER_SOL
+        } SOL from ${keypair.publicKey.toString()}`
       );
 
-      const balance = await connection.getBalance(keypair.publicKey);
+      // Transfer the ENTIRE balance from the buyer wallet to the main wallet.
+      instructionsForChunk.push(
+        SystemProgram.transfer({
+          fromPubkey: keypair.publicKey,
+          toPubkey: payer.publicKey,
+          lamports: balance,
+        })
+      );
 
-      const sendSOLixs = SystemProgram.transfer({
-        fromPubkey: keypair.publicKey,
-        toPubkey: payer.publicKey,
-        lamports: balance,
-      });
-
-      instructionsForChunk.push(sendSOLixs);
+      // Mark this buyer wallet as an extra signer
+      extraSigners.push(keypair);
     }
 
-    if (chunkIndex === chunkedKeypairs.length - 1) {
-      const tipSwapIxn = SystemProgram.transfer({
+    if (instructionsForChunk.length === 0) {
+      console.log("Skipping empty transaction batch.");
+      continue;
+    }
+
+    // Add the Jito tip transfer (this is from the main wallet so no extra signer is needed)
+    instructionsForChunk.push(
+      SystemProgram.transfer({
         fromPubkey: payer.publicKey,
         toPubkey: getRandomTipAccount(),
         lamports: BigInt(TipAmt),
-      });
-      instructionsForChunk.push(tipSwapIxn);
-      console.log("Jito tip added :).");
-    }
-
-    const lut = new PublicKey(poolInfo.addressLUT.toString());
-
-    const message = new TransactionMessage({
-      payerKey: payer.publicKey,
-      recentBlockhash: blockhash,
-      instructions: instructionsForChunk,
-    }).compileToV0Message([poolInfo.addressLUT]);
-
-    const versionedTx = new VersionedTransaction(message);
-
-    const serializedMsg = versionedTx.serialize();
-    console.log("Txn size:", serializedMsg.length);
-    if (serializedMsg.length > 1232) {
-      console.log("tx too big");
-    }
-
-    console.log(
-      "Signing transaction with chunk signers",
-      chunk.map((kp) => kp.publicKey.toString())
+      })
     );
 
-    versionedTx.sign([payer]);
+    console.log("Jito tip added.");
 
-    for (const keypair of chunk) {
-      versionedTx.sign([keypair]);
-    }
+    // Create and sign the transaction with both the payer and the buyer wallets
+    const versionedTx = await createAndSignVersionedTxWithKeypairs(
+      instructionsForChunk,
+      blockhash,
+      extraSigners
+    );
+    if (versionedTx) txsSigned.push(versionedTx);
+  }
 
-    txsSigned.push(versionedTx);
+  if (txsSigned.length === 0) {
+    console.log("No valid transactions, skipping bundle send.");
+    return;
   }
 
   await sendBundle(txsSigned);
+
+  // Delete local keypair files to force creation of fresh wallets next time
+  console.log("Deleting old keypair files to ensure fresh wallets...");
+  for (const keypair of keypairs) {
+    const filePath = path.join(
+      __dirname,
+      "..",
+      "keys",
+      `${keypair.publicKey.toString()}.json`
+    );
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      console.log(`Deleted keypair file: ${filePath}`);
+    }
+  }
+
+  console.log(
+    "✅ All buyer accounts drained and local keypair files deleted. New wallets can now be generated."
+  );
 }
 
 async function simulateAndWriteBuys() {
