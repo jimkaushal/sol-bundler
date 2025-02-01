@@ -28,7 +28,6 @@ if (fs.existsSync(keyInfoPath)) {
   const data = fs.readFileSync(keyInfoPath, "utf-8");
   poolInfo = JSON.parse(data);
 }
-
 interface Buy {
   pubkey: PublicKey;
   solAmount: Number;
@@ -128,54 +127,23 @@ async function createAndSignVersionedTxWithKeypairs(
   instructionsChunk: TransactionInstruction[],
   blockhash: Blockhash | string
 ): Promise<VersionedTransaction> {
-  let poolInfo: { [key: string]: any } = {};
-  if (fs.existsSync(keyInfoPath)) {
-    const data = fs.readFileSync(keyInfoPath, "utf-8");
-    poolInfo = JSON.parse(data);
-  }
-
   const lut = new PublicKey(poolInfo.addressLUT.toString());
-  console.log({ lut });
   const lookupTableAccount = (await connection.getAddressLookupTable(lut))
     .value;
 
   if (lookupTableAccount == null) {
-    console.log("Lookup table account not found!5");
+    console.log("Lookup table account not found!");
     process.exit(0);
   }
-
-  const addressesMain: PublicKey[] = [];
-  instructionsChunk.forEach((ixn) => {
-    ixn.keys.forEach((key) => {
-      addressesMain.push(key.pubkey);
-    });
-  });
 
   const message = new TransactionMessage({
     payerKey: payer.publicKey,
     recentBlockhash: blockhash,
     instructions: instructionsChunk,
   }).compileToV0Message([lookupTableAccount]);
-  console.log("Message:", message);
-  // console.log("Instructions:", message.instructions);
-  // console.log("Fee Payer:", message.feePayer);
-  console.log("Recent Blockhash:", message.recentBlockhash);
 
   const versionedTx = new VersionedTransaction(message);
-
   versionedTx.sign([payer]);
-
-  /*
-    // Simulate each txn
-    const simulationResult = await connection.simulateTransaction(versionedTx, { commitment: "processed" });
-
-    if (simulationResult.value.err) {
-    console.log("Simulation error:", simulationResult.value.err);
-    } else {
-    console.log("Simulation success. Logs:");
-    simulationResult.value.logs?.forEach(log => console.log(log));
-    }
-    */
 
   return versionedTx;
 }
@@ -185,11 +153,11 @@ async function processInstructionsSOL(
   blockhash: string | Blockhash
 ): Promise<VersionedTransaction[]> {
   const txns: VersionedTransaction[] = [];
-  const instructionChunks = chunkArray(ixs, 45);
+  const instructionChunks = chunkArray(ixs, 20);
 
-  for (let i = 0; i < instructionChunks.length; i++) {
+  for (const chunk of instructionChunks) {
     const versionedTx = await createAndSignVersionedTxWithKeypairs(
-      instructionChunks[i],
+      chunk,
       blockhash
     );
     txns.push(versionedTx);
@@ -199,54 +167,26 @@ async function processInstructionsSOL(
 }
 
 async function sendBundle(txns: VersionedTransaction[]) {
-  /*
-    // Simulate each transaction
-    for (const tx of txns) {
-        try {
-            const simulationResult = await connection.simulateTransaction(tx, { commitment: "processed" });
-
-            if (simulationResult.value.err) {
-                console.error("Simulation error for transaction:", simulationResult.value.err);
-            } else {
-                console.log("Simulation success for transaction. Logs:");
-                simulationResult.value.logs?.forEach(log => console.log(log));
-            }
-        } catch (error) {
-            console.error("Error during simulation:", error);
-        }
-    }
-    */
-
   try {
     const bundleId = await searcherClient.sendBundle(
       new JitoBundle(txns, txns.length)
     );
     console.log(`Bundle ${bundleId} sent.`);
   } catch (error) {
-    const err = error as any;
-    console.error("Error sending bundle:", err.message);
-
-    if (err?.message?.includes("Bundle Dropped, no connected leader up soon")) {
-      console.error(
-        "Error sending bundle: Bundle Dropped, no connected leader up soon."
-      );
-    } else {
-      console.error("An unexpected error occurred:", err.message);
-    }
+    console.error("Error sending bundle:", error);
   }
 }
 
 async function generateATAandSOL() {
   const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
-
   const { blockhash } = await connection.getLatestBlockhash();
   const sendTxns: VersionedTransaction[] = [];
 
   const solIxs = await generateSOLTransferForKeypairs(jitoTipAmt);
-
   const solTxns = await processInstructionsSOL(solIxs, blockhash);
   sendTxns.push(...solTxns);
-  console.log("Sending SOL bundle...", solTxns.length, "txns", solTxns);
+
+  console.log("Sending SOL bundle...", solTxns.length, "txns");
   await sendBundle(sendTxns);
 }
 
@@ -450,7 +390,6 @@ function writeBuysToFile(buys: Buy[]) {
   fs.writeFileSync(keyInfoPath, JSON.stringify(buysObj, null, 2), "utf8");
   console.log("Buys have been successfully saved to keyinfo.json");
 }
-
 export async function sender() {
   let running = true;
 
@@ -462,7 +401,7 @@ export async function sender() {
     console.log("4. Send Simulation SOL Bundle");
     console.log("5. Reclaim Buyers Sol");
 
-    const answer = prompt("Choose an option or 'exit': "); // Use prompt-sync for user input
+    const answer = prompt("Choose an option or 'exit': ");
 
     switch (answer) {
       case "1":
@@ -487,6 +426,5 @@ export async function sender() {
         console.log("Invalid option, please choose again.");
     }
   }
-
   console.log("Exiting...");
 }
