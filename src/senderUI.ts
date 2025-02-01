@@ -55,7 +55,7 @@ async function generateSOLTransferForKeypairs(
   ) {
     console.log(`Missing solAmount for dev wallet, skipping.`);
   }
-
+  console.log({ existingWallet: existingData[wallet.publicKey.toString()] });
   const solAmount = parseFloat(
     existingData[wallet.publicKey.toString()].solAmount
   );
@@ -156,6 +156,10 @@ async function createAndSignVersionedTxWithKeypairs(
     recentBlockhash: blockhash,
     instructions: instructionsChunk,
   }).compileToV0Message([lookupTableAccount]);
+  console.log("Message:", message);
+  // console.log("Instructions:", message.instructions);
+  // console.log("Fee Payer:", message.feePayer);
+  console.log("Recent Blockhash:", message.recentBlockhash);
 
   const versionedTx = new VersionedTransaction(message);
 
