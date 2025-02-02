@@ -139,7 +139,7 @@ async function createAndSignVersionedTxWithKeypairs(
   let lookupTableAccount = null;
   if (poolInfo.addressLUT) {
     const lut = new PublicKey(poolInfo.addressLUT.toString());
-    lookupTableAccount = (await connection.getAddressLookupTable(lut)).value;
+    lookupTableAccount = await getLUTWithRetry(lut);
     if (!lookupTableAccount) {
       console.log(
         "Warning: Lookup table account not found, continuing without LUT."
@@ -208,9 +208,29 @@ async function sendBundle(txns: VersionedTransaction[]) {
   }
 }
 
+async function getLatestBlockhashWithRetry(retries = 3, delayMs = 1000) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const blockhashResponse = await connection.getLatestBlockhash();
+      return blockhashResponse;
+    } catch (err) {
+      console.warn(`Attempt ${attempt} to fetch blockhash failed: ${err}`);
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        throw new Error(
+          `Failed to fetch blockhash after ${retries} attempts: ${err}`
+        );
+      }
+    }
+  }
+  // Fallback, should never reach here.
+  throw new Error("Unexpected error in getLatestBlockhashWithRetry");
+}
+
 async function generateATAandSOL() {
   const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
-  const { blockhash } = await connection.getLatestBlockhash();
+  const { blockhash } = await getLatestBlockhashWithRetry();
   const sendTxns: VersionedTransaction[] = [];
 
   const solIxs = await generateSOLTransferForKeypairs(jitoTipAmt);
@@ -221,23 +241,122 @@ async function generateATAandSOL() {
   await sendBundle(sendTxns);
 }
 
+/** Helper to delete all keypair files in src/keypairs */
+function deleteAllKeypairFiles() {
+  const keysFolderPath = path.join(process.cwd(), "src", "keypairs");
+  console.log(`Attempting to delete keypair files in: ${keysFolderPath}`);
+  if (fs.existsSync(keysFolderPath)) {
+    const files = fs.readdirSync(keysFolderPath);
+    if (files.length === 0) {
+      console.log("No keypair files found to delete.");
+    }
+    files.forEach((file) => {
+      const filePath = path.join(keysFolderPath, file);
+      try {
+        fs.unlinkSync(filePath);
+        console.log(`Deleted keypair file: ${filePath}`);
+      } catch (err) {
+        console.error(`Error deleting file ${filePath}:`, err);
+      }
+    });
+  } else {
+    console.log(`Keypairs folder does not exist at ${keysFolderPath}`);
+  }
+}
+
+async function getLUTWithRetry(
+  lutPublicKey: PublicKey,
+  retries = 3,
+  delayMs = 1000
+) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await connection.getAddressLookupTable(lutPublicKey);
+      if (response.value) return response.value;
+    } catch (err) {
+      console.warn(`Attempt ${attempt} failed: ${err}`);
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      } else {
+        throw err;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Clears buyer simulation data from src/keyInfo.json while preserving reserved keys:
+ * addressLUT, mint, and mintPk.
+ */
+function clearKeyInfo() {
+  // Build the path relative to the project root.
+  const keyInfoPath = path.join(process.cwd(), "src", "keyInfo.json");
+  console.log(`Attempting to clear keyInfo.json at: ${keyInfoPath}`);
+
+  if (fs.existsSync(keyInfoPath)) {
+    try {
+      // Read the existing file, if it exists.
+      const rawData = fs.readFileSync(keyInfoPath, "utf8");
+      let data: { [key: string]: any } = {};
+      try {
+        data = JSON.parse(rawData);
+      } catch (parseErr) {
+        console.error(
+          "Error parsing keyInfo.json. Overwriting with an empty object."
+        );
+      }
+
+      // Preserve reserved keys: addressLUT, mint, mintPk
+      const preserved: { [key: string]: any } = {};
+      if (data.addressLUT) {
+        preserved.addressLUT = data.addressLUT;
+      }
+      if (data.mint) {
+        preserved.mint = data.mint;
+      }
+      if (data.mintPk) {
+        preserved.mintPk = data.mintPk;
+      }
+
+      // Write the preserved data back to keyInfo.json.
+      fs.writeFileSync(keyInfoPath, JSON.stringify(preserved, null, 2), "utf8");
+      console.log(
+        "Cleared buyer simulation data from keyInfo.json while preserving LUT and mint info."
+      );
+    } catch (err) {
+      console.error("Error clearing keyInfo.json:", err);
+    }
+  } else {
+    console.log("keyInfo.json does not exist at", keyInfoPath);
+  }
+}
+
 async function createReturns() {
   const txsSigned: VersionedTransaction[] = [];
   const keypairs = loadKeypairs();
-  const chunkedKeypairs = chunkArray(keypairs, 7);
+  const chunkedKeypairs = chunkArray(keypairs, 7); // assuming chunkArray is defined elsewhere
 
   const jitoTipIn = prompt("Jito tip in Sol (Ex. 0.01): ");
   const TipAmt = parseFloat(jitoTipIn) * LAMPORTS_PER_SOL;
 
-  const { blockhash } = await connection.getLatestBlockhash();
+  // Use the retry helper to fetch the blockhash
+  let blockhashResponse;
+  try {
+    blockhashResponse = await getLatestBlockhashWithRetry();
+  } catch (err) {
+    console.error("Failed to fetch blockhash after retries:", err);
+    return;
+  }
+  const { blockhash } = blockhashResponse;
 
+  // Process each chunk of keypairs
   for (const chunk of chunkedKeypairs) {
-    const instructionsForChunk: TransactionInstruction[] = [];
-    const extraSigners: Keypair[] = []; // Collect buyer wallets that are spending funds
+    const instructionsForChunk = [];
+    const extraSigners: Keypair[] = [];
 
     for (const keypair of chunk) {
       console.log(`Processing keypair: ${keypair.publicKey.toString()}`);
-
       let balance = 0;
       let retryCount = 0;
       let success = false;
@@ -264,7 +383,8 @@ async function createReturns() {
         continue;
       }
 
-      if (balance === 0) {
+      // Skip wallets with negligible balance (here defined as <= 10000 lamports)
+      if (balance <= 10000) {
         console.log(
           `Skipping keypair ${keypair.publicKey.toString()} because it has no SOL.`
         );
@@ -277,7 +397,7 @@ async function createReturns() {
         } SOL from ${keypair.publicKey.toString()}`
       );
 
-      // Transfer the ENTIRE balance from the buyer wallet to the main wallet.
+      // Create a transfer instruction from the buyer wallet to the main wallet
       instructionsForChunk.push(
         SystemProgram.transfer({
           fromPubkey: keypair.publicKey,
@@ -286,59 +406,44 @@ async function createReturns() {
         })
       );
 
-      // Mark this buyer wallet as an extra signer
       extraSigners.push(keypair);
     }
 
-    if (instructionsForChunk.length === 0) {
-      console.log("Skipping empty transaction batch.");
-      continue;
+    // If there are instructions for this chunk, add the Jito tip and create a transaction
+    if (instructionsForChunk.length > 0) {
+      instructionsForChunk.push(
+        SystemProgram.transfer({
+          fromPubkey: payer.publicKey,
+          toPubkey: getRandomTipAccount(), // ensure getRandomTipAccount() is defined
+          lamports: BigInt(TipAmt),
+        })
+      );
+      const versionedTx = await createAndSignVersionedTxWithKeypairs(
+        instructionsForChunk,
+        blockhash,
+        extraSigners
+      );
+      if (versionedTx) txsSigned.push(versionedTx);
     }
-
-    // Add the Jito tip transfer (this is from the main wallet so no extra signer is needed)
-    instructionsForChunk.push(
-      SystemProgram.transfer({
-        fromPubkey: payer.publicKey,
-        toPubkey: getRandomTipAccount(),
-        lamports: BigInt(TipAmt),
-      })
-    );
-
-    console.log("Jito tip added.");
-
-    // Create and sign the transaction with both the payer and the buyer wallets
-    const versionedTx = await createAndSignVersionedTxWithKeypairs(
-      instructionsForChunk,
-      blockhash,
-      extraSigners
-    );
-    if (versionedTx) txsSigned.push(versionedTx);
   }
 
+  // If no transactions were created, log and cleanup before returning
   if (txsSigned.length === 0) {
     console.log("No valid transactions, skipping bundle send.");
+    // Call cleanup functions even if no transactions exist
+    deleteAllKeypairFiles();
+    clearKeyInfo();
     return;
   }
 
+  // Otherwise, send the bundle and then perform cleanup
   await sendBundle(txsSigned);
 
-  // Delete local keypair files to force creation of fresh wallets next time
-  console.log("Deleting old keypair files to ensure fresh wallets...");
-  for (const keypair of keypairs) {
-    const filePath = path.join(
-      __dirname,
-      "..",
-      "keys",
-      `${keypair.publicKey.toString()}.json`
-    );
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-      console.log(`Deleted keypair file: ${filePath}`);
-    }
-  }
-
+  // After sending, clean up local keypair files and keyInfo.json
+  deleteAllKeypairFiles();
+  clearKeyInfo();
   console.log(
-    "✅ All buyer accounts drained and local keypair files deleted. New wallets can now be generated."
+    "✅ All buyer keypairs have been deleted and simulation data cleared. New wallets can now be generated."
   );
 }
 
