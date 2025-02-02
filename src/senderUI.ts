@@ -14,6 +14,8 @@ import {
   TOKEN_PROGRAM_ID,
   createCloseAccountInstruction,
 } from "@solana/spl-token";
+// Import the new live Pump.fun functions
+import { liveBuyPumpFun, liveSellPumpFun } from "./livePumpFun";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
 import promptSync from "prompt-sync";
@@ -22,6 +24,7 @@ import fs from "fs";
 import path from "path";
 import { getRandomTipAccount } from "./clients/config";
 import BN from "bn.js";
+import { liveBuyAndSellPumpFun } from "./livePumpFunSnipe";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
@@ -580,7 +583,8 @@ export async function sender() {
     console.log("3. Simulate Buys");
     console.log("4. Send Simulation SOL Bundle");
     console.log("5. Reclaim Buyers Sol");
-
+    console.log("6. Live Pump.fun Buy");
+    console.log("7. Live Pump.fun Sell");
     const answer = prompt("Choose an option or 'exit': ");
 
     switch (answer) {
@@ -598,6 +602,17 @@ export async function sender() {
         break;
       case "5":
         await createReturns();
+        break;
+      case "6":
+        // New: Live Pump.fun Buy
+        await liveBuyPumpFun();
+        break;
+      case "7":
+        // New: Live Pump.fun Sell
+        await liveSellPumpFun();
+        break;
+      case "8":
+        await liveBuyAndSellPumpFun();
         break;
       case "exit":
         running = false;
