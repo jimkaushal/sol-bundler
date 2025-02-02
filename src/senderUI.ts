@@ -25,6 +25,7 @@ import path from "path";
 import { getRandomTipAccount } from "./clients/config";
 import BN from "bn.js";
 import { liveBuyAndSellPumpFun } from "./livePumpFunSnipe";
+import { liveBuyAndSellPumpFunDevnet } from "./livePumpFunDevnet";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
@@ -585,6 +586,8 @@ export async function sender() {
     console.log("5. Reclaim Buyers Sol");
     console.log("6. Live Pump.fun Buy");
     console.log("7. Live Pump.fun Sell");
+    console.log("8. Live Pump.fun Buy/Sell Snipper");
+    console.log("9. Devnet Pump.fun Buy/Sell Test"); // New option for devnet testing
     const answer = prompt("Choose an option or 'exit': ");
 
     switch (answer) {
@@ -613,6 +616,10 @@ export async function sender() {
         break;
       case "8":
         await liveBuyAndSellPumpFun();
+        break;
+      case "9":
+        // Devnet test option using our new devnet testing file.
+        await liveBuyAndSellPumpFunDevnet();
         break;
       case "exit":
         running = false;

@@ -58,7 +58,7 @@ async function getTokenMintInfo(mintAddress: string): Promise<Mint> {
     const mintInfo = await getMint(connection, new PublicKey(mintAddress));
     return mintInfo;
   } catch (err) {
-    console.error("Error fetching token mint info:", err);
+    console.error("Error fetching token mint info222:", err);
     throw err;
   }
 }
@@ -81,7 +81,7 @@ function createPumpFunSwapInstructionForBuy(params: {
       { pubkey: tokenMint, isSigner: false, isWritable: false },
       // Add any additional accounts as required.
     ],
-    programId: new PublicKey("PumPFun1111111111111111111111111111111111"), // Dummy program ID
+    programId: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"), // Dummy program ID
     data: instructionData,
   });
 }
@@ -103,7 +103,7 @@ function createPumpFunSwapInstructionForSell(params: {
       { pubkey: buyerPubkey, isSigner: true, isWritable: true },
       { pubkey: tokenMint, isSigner: false, isWritable: false },
     ],
-    programId: new PublicKey("PumPFun1111111111111111111111111111111111"),
+    programId: new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
     data: instructionData,
   });
 }

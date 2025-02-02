@@ -8,7 +8,8 @@ Enjoy launches that are completely bubble maps-proof and anti-Photon SB marks.
 
 For more details, contact here: telegram: [@shiny0103](https://t.me/shiny0103)
 
-
+### DEVNET RELATED
+LUT for devnet "addressLUT": "qAJZMgnQJ8G6vA3WRcjD9Jan1wtKkaCFWLWskxJrR5V",
 
 ## Features
 
