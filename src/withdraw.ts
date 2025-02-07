@@ -25,7 +25,11 @@ import {
 } from "../config"; // adjust the import path as needed
 
 const prompt = promptSync();
-
+async function getFreshBlockhash() {
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash();
+  return { blockhash, lastValidBlockHeight };
+}
 export async function withdrawLiquidity() {
   // Set up the Anchor provider and program
   const provider = new anchor.AnchorProvider(
@@ -90,7 +94,9 @@ export async function withdrawLiquidity() {
     .instruction();
 
   // Get a recent blockhash and build the transaction
-  const { blockhash } = await connection.getLatestBlockhash();
+  // const { blockhash } = await connection.getLatestBlockhash();
+  const { blockhash } = await getFreshBlockhash();
+
   const message = new TransactionMessage({
     payerKey: wallet.publicKey,
     recentBlockhash: blockhash,

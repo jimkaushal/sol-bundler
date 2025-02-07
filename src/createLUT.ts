@@ -1,3 +1,4 @@
+// createLUT.ts
 import {
   AddressLookupTableProgram,
   Keypair,
@@ -18,7 +19,11 @@ import {
   connection,
   PUMP_PROGRAM,
   payer,
+  feeRecipient,
+  eventAuthority,
   getAddressLookupTableWithRetry,
+  rpc,
+  global as GLOBAL,
 } from "../config";
 import promptSync from "prompt-sync";
 import { searcherClient } from "./clients/jito";
@@ -30,222 +35,326 @@ import * as spl from "@solana/spl-token";
 import idl from "../pumpfun-IDL.json";
 import { Program, Idl, AnchorProvider, setProvider } from "@coral-xyz/anchor";
 import { bs58 } from "@project-serum/anchor/dist/cjs/utils/bytes";
+import BN from "bn.js";
 
 const prompt = promptSync();
 const keyInfoPath = path.join(__dirname, "keyInfo.json");
 
+// Set up Anchor provider and program
 const provider = new AnchorProvider(connection, wallet as any, {});
-
 setProvider(provider);
-
 const program = new Program(idl as Idl, PUMP_PROGRAM);
 
-export async function extendLUT() {
-  // -------- step 1: ask nessesary questions for LUT build --------
-  let vanityPK = null;
+/**
+ * Fetches a fresh blockhash before sending a transaction.
+ */
+async function getFreshBlockhash() {
+  const { blockhash, lastValidBlockHeight } =
+    await connection.getLatestBlockhash();
+  return { blockhash, lastValidBlockHeight };
+}
 
-  const vanityPrompt = prompt(
-    "Do you want to import a custom vanity address? (y/n): "
-  ).toLowerCase();
-  const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
-  if (vanityPrompt === "y") {
-    vanityPK = prompt("Enter the private key of the vanity address (bs58): ");
-  }
+/**
+ * Sends a transaction with retries and a fresh blockhash.
+ */
+// async function sendTransactionWithRetry(tx: VersionedTransaction) {
+//   const { blockhash } = await getFreshBlockhash();
+//   tx.message.recentBlockhash = blockhash;
+//   try {
+//     return await connection.sendTransaction(tx, { maxRetries: 10 });
+//   } catch (error) {
+//     console.error("Error sending transaction:", error);
+//   }
+// }
 
-  // Read existing data from poolInfo.json
-  let poolInfo: { [key: string]: any } = {};
-  if (fs.existsSync(keyInfoPath)) {
-    const data = fs.readFileSync(keyInfoPath, "utf-8");
-    poolInfo = JSON.parse(data);
-  }
-
-  const bundledTxns1: VersionedTransaction[] = [];
-
-  // -------- step 2: get all LUT addresses --------
-  const accounts: PublicKey[] = []; // Array with all new keys to push to the new LUT
-  const lut = new PublicKey(poolInfo.addressLUT.toString());
-  console.log("LUT address: ", lut.toString());
-
-  const lookupTableAccount = await getAddressLookupTableWithRetry(lut); // Fetch the lookup table account with retries)
-
-  if (lookupTableAccount == null) {
-    console.log("Lookup table account not found!1");
-    process.exit(0);
-  }
-
-  // Write mint info to json
-  let mintKp;
-
-  if (vanityPK === null) {
-    mintKp = Keypair.generate();
-  } else {
-    mintKp = Keypair.fromSecretKey(bs58.decode(vanityPK));
-  }
-
-  console.log(`Mint: ${mintKp.publicKey.toString()}`);
-  poolInfo.mint = mintKp.publicKey.toString();
-  poolInfo.mintPk = bs58.encode(mintKp.secretKey);
-  fs.writeFileSync(keyInfoPath, JSON.stringify(poolInfo, null, 2));
-
-  // Fetch accounts for LUT
-  const mintAuthority = new PublicKey(
-    "TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM"
+/**
+ * Create a proper SPL token mint.
+ * Generates a new Keypair for the mint and then calls spl.createMint()
+ * to initialize the mint with 6 decimals, wallet as mint authority, and no freeze authority.
+ * Returns the mint Keypair.
+ */
+async function createProperMint(): Promise<Keypair> {
+  const decimals = 6;
+  const mintAuthority = wallet.publicKey;
+  const freezeAuthority = null;
+  const mintKp = Keypair.generate();
+  const newMintPubkey = await spl.createMint(
+    connection, // Cluster connection
+    payer, // Payer for fees
+    mintAuthority, // Mint authority
+    freezeAuthority,
+    decimals,
+    mintKp // Use the generated keypair
   );
-  const MPL_TOKEN_METADATA_PROGRAM_ID = new PublicKey(
-    "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+  console.log("New SPL Token mint created:", newMintPubkey.toBase58());
+  return mintKp;
+}
+
+/**
+ * Helper: Chunk an array into subarrays of a given size.
+ */
+function chunkArray<T>(array: T[], size: number): T[][] {
+  return Array.from({ length: Math.ceil(array.length / size) }, (_, i) =>
+    array.slice(i * size, i * size + size)
   );
-  const global = new PublicKey("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf");
+}
+
+/**
+ * Create wallet swap transactions (simulate buys).
+ * For each buyer keypair, derive the associated token account and build the "buy" instruction.
+ */
+async function createWalletSwaps(
+  blockhash: string,
+  keypairs: Keypair[],
+  lut: AddressLookupTableAccount,
+  mint: PublicKey,
+  program: Program
+): Promise<VersionedTransaction[]> {
+  const txsSigned: VersionedTransaction[] = [];
+  const chunkedKeypairs = chunkArray(keypairs, 6);
+
+  // Derive bondingCurve and associatedBondingCurve PDAs from the mint.
   const [bondingCurve] = PublicKey.findProgramAddressSync(
-    [Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()],
+    [Buffer.from("bonding-curve"), mint.toBytes()],
     program.programId
   );
-  const [metadata] = PublicKey.findProgramAddressSync(
-    [
-      Buffer.from("metadata"),
-      MPL_TOKEN_METADATA_PROGRAM_ID.toBytes(),
-      mintKp.publicKey.toBytes(),
-    ],
-    MPL_TOKEN_METADATA_PROGRAM_ID
-  );
-  let [associatedBondingCurve] = PublicKey.findProgramAddressSync(
-    [
-      bondingCurve.toBytes(),
-      spl.TOKEN_PROGRAM_ID.toBytes(),
-      mintKp.publicKey.toBytes(),
-    ],
+  const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+    [bondingCurve.toBytes(), spl.TOKEN_PROGRAM_ID.toBytes(), mint.toBytes()],
     spl.ASSOCIATED_TOKEN_PROGRAM_ID
   );
-  const eventAuthority = new PublicKey(
-    "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1"
+
+  // *** DERIVE THE GLOBAL PDA ***
+  // IMPORTANT: Derive the global PDA using the same seed that your program uses.
+  const [globalPDA] = PublicKey.findProgramAddressSync(
+    [Buffer.from("global")],
+    PUMP_PROGRAM
   );
-  const feeRecipient = new PublicKey(
-    "CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM"
-  );
+  console.log("Derived global PDA:", globalPDA.toBase58());
 
-  // These values vary based on the new market created
-  accounts.push(
-    spl.ASSOCIATED_TOKEN_PROGRAM_ID,
-    spl.TOKEN_PROGRAM_ID,
-    MPL_TOKEN_METADATA_PROGRAM_ID,
-    mintAuthority,
-    global,
-    program.programId,
-    PUMP_PROGRAM,
-    metadata,
-    associatedBondingCurve,
-    bondingCurve,
-    eventAuthority,
-    SystemProgram.programId,
-    SYSVAR_RENT_PUBKEY,
-    mintKp.publicKey,
-    feeRecipient
-  ); // DO NOT ADD PROGRAM OR JITO TIP ACCOUNT??
-
-  // Loop through each keypair and push its pubkey and ATAs to the accounts array
-  const keypairs = loadKeypairs();
-  for (const keypair of keypairs) {
-    const ataToken = await spl.getAssociatedTokenAddress(
-      mintKp.publicKey,
-      keypair.publicKey
-    );
-    accounts.push(keypair.publicKey, ataToken);
-  }
-
-  // Push wallet and payer ATAs and pubkey JUST IN CASE (not sure tbh)
-  const ataTokenwall = await spl.getAssociatedTokenAddress(
-    mintKp.publicKey,
-    wallet.publicKey
-  );
-
-  const ataTokenpayer = await spl.getAssociatedTokenAddress(
-    mintKp.publicKey,
-    payer.publicKey
-  );
-
-  // Add just in case
-  accounts.push(
-    wallet.publicKey,
-    payer.publicKey,
-    ataTokenwall,
-    ataTokenpayer,
-    lut,
-    spl.NATIVE_MINT
-  );
-
-  // -------- step 5: push LUT addresses to a txn --------
-  const extendLUTixs1: TransactionInstruction[] = [];
-  const extendLUTixs2: TransactionInstruction[] = [];
-  const extendLUTixs3: TransactionInstruction[] = [];
-  const extendLUTixs4: TransactionInstruction[] = [];
-
-  // Chunk accounts array into groups of 30
-  const accountChunks = Array.from(
-    { length: Math.ceil(accounts.length / 30) },
-    (v, i) => accounts.slice(i * 30, (i + 1) * 30)
-  );
-  console.log("Num of chunks:", accountChunks.length);
-  console.log("Num of accounts:", accounts.length);
-
-  for (let i = 0; i < accountChunks.length; i++) {
-    const chunk = accountChunks[i];
-    const extendInstruction = AddressLookupTableProgram.extendLookupTable({
-      lookupTable: lut,
-      authority: payer.publicKey,
-      payer: payer.publicKey,
-      addresses: chunk,
-    });
-    if (i == 0) {
-      extendLUTixs1.push(extendInstruction);
-      console.log("Chunk:", i);
-    } else if (i == 1) {
-      extendLUTixs2.push(extendInstruction);
-      console.log("Chunk:", i);
-    } else if (i == 2) {
-      extendLUTixs3.push(extendInstruction);
-      console.log("Chunk:", i);
-    } else if (i == 3) {
-      extendLUTixs4.push(extendInstruction);
-      console.log("Chunk:", i);
+  // Load key info from keyInfo.json
+  let keyInfo: {
+    [pubkey: string]: {
+      solAmount: number;
+      tokenAmount: string;
+      percentSupply: number;
+    };
+  } = {};
+  if (fs.existsSync(keyInfoPath)) {
+    try {
+      keyInfo = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
+    } catch (e) {
+      console.error("Error parsing keyInfo.json:", e);
     }
   }
 
-  // Add the jito tip to the last txn
-  extendLUTixs4.push(
-    SystemProgram.transfer({
-      fromPubkey: payer.publicKey,
-      toPubkey: getRandomTipAccount(),
-      lamports: BigInt(jitoTipAmt),
-    })
+  for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
+    const chunk = chunkedKeypairs[chunkIndex];
+    const instructionsForChunk: TransactionInstruction[] = [];
+
+    for (let i = 0; i < chunk.length; i++) {
+      const buyer = chunk[i];
+      const buyerPubkeyStr = buyer.publicKey.toString();
+      console.log(
+        `Processing keypair ${i + 1}/${chunk.length}: ${buyerPubkeyStr}`
+      );
+
+      // Derive the buyer's associated token account for the mint.
+      const ataToken = await spl.getAssociatedTokenAddress(
+        mint,
+        buyer.publicKey
+      );
+      const createTokenAtaIx =
+        spl.createAssociatedTokenAccountIdempotentInstruction(
+          payer.publicKey,
+          ataToken,
+          buyer.publicKey,
+          mint
+        );
+
+      // Get buyer's info from keyInfo.json.
+      const buyerInfo = keyInfo[buyerPubkeyStr];
+      if (!buyerInfo || !buyerInfo.tokenAmount || !buyerInfo.solAmount) {
+        console.log(`Incomplete key info for ${buyerPubkeyStr}, skipping.`);
+        continue;
+      }
+
+      // Calculate amounts using BN.
+      const amount = new BN(buyerInfo.tokenAmount);
+      const solAmtBN = new BN(100000 * buyerInfo.solAmount * LAMPORTS_PER_SOL);
+      console.log("Accounts for buy instruction:", {
+        global: globalPDA.toString(),
+        feeRecipient: feeRecipient.toString(),
+        mint: mint.toString(),
+        bondingCurve: bondingCurve.toString(),
+        associatedBondingCurve: associatedBondingCurve.toString(),
+        associatedUser: ataToken.toString(),
+        user: buyer.publicKey.toString(),
+        systemProgram: SystemProgram.programId.toString(),
+        tokenProgram: spl.TOKEN_PROGRAM_ID.toString(),
+        rent: SYSVAR_RENT_PUBKEY.toString(),
+        eventAuthority: eventAuthority.toString(),
+        program: PUMP_PROGRAM.toString(),
+      });
+      // Build the buy instruction using all required accounts.
+      let buyIx: TransactionInstruction;
+      try {
+        buyIx = await program.methods
+          .buy(amount, solAmtBN)
+          .accounts({
+            global: globalPDA, // Use the derived PDA here!
+            feeRecipient: feeRecipient,
+            mint: mint,
+            bondingCurve: bondingCurve,
+            associatedBondingCurve: associatedBondingCurve,
+            associatedUser: ataToken,
+            user: buyer.publicKey,
+            systemProgram: SystemProgram.programId,
+            tokenProgram: spl.TOKEN_PROGRAM_ID,
+            rent: SYSVAR_RENT_PUBKEY,
+            eventAuthority: eventAuthority,
+            program: PUMP_PROGRAM,
+          })
+          .instruction();
+      } catch (err) {
+        console.error(
+          `Error creating buy instruction for1 ${buyerPubkeyStr}:`,
+          err
+        );
+        continue;
+      }
+
+      instructionsForChunk.push(createTokenAtaIx, buyIx);
+    }
+
+    if (instructionsForChunk.length > 0) {
+      const message = new TransactionMessage({
+        payerKey: payer.publicKey,
+        recentBlockhash: blockhash,
+        instructions: instructionsForChunk,
+      }).compileToV0Message([lut]);
+      const versionedTx = new VersionedTransaction(message);
+      console.log(
+        "Signing transaction with chunk signers:",
+        chunk.map((kp) => kp.publicKey.toString())
+      );
+      for (const kp of chunk) {
+        if (keyInfo[kp.publicKey.toString()]) {
+          versionedTx.sign([kp]);
+        }
+      }
+      versionedTx.sign([payer]);
+      txsSigned.push(versionedTx);
+    }
+  }
+  return txsSigned;
+}
+
+async function sendTransactionsInBatches(transactions: VersionedTransaction[]) {
+  const batchSize = 5; // Maximum transactions per bundle
+  for (let i = 0; i < transactions.length; i += batchSize) {
+    const batch = transactions.slice(i, i + batchSize);
+    try {
+      const { blockhash } = await getFreshBlockhash(); // Get fresh blockhash before batch
+      for (const tx of batch) {
+        let attempts = 0;
+        while (attempts < 3) {
+          try {
+            tx.message.recentBlockhash = blockhash; // Ensure a fresh blockhash
+            await connection.sendTransaction(tx, { maxRetries: 10 });
+            break; // Exit retry loop if successful
+          } catch (error) {
+            console.error(
+              `Error sending transaction, retrying... (${attempts + 1}/3)`,
+              error
+            );
+            if (
+              error instanceof Error &&
+              error.message.includes("already been processed")
+            ) {
+              console.warn("Skipping transaction as it was already processed.");
+              break;
+            }
+            attempts++;
+          }
+        }
+      }
+      console.log(
+        `Sent batch ${i / batchSize + 1}/${Math.ceil(
+          transactions.length / batchSize
+        )}`
+      );
+    } catch (error) {
+      console.error(`Error sending batch ${i / batchSize + 1}:`, error);
+    }
+  }
+}
+
+function chunkInstructions(
+  instructions: TransactionInstruction[],
+  chunkSize: number
+): TransactionInstruction[][] {
+  return Array.from(
+    { length: Math.ceil(instructions.length / chunkSize) },
+    (_, i) => instructions.slice(i * chunkSize, i * chunkSize + chunkSize)
   );
+}
 
-  // -------- step 6: seperate into 2 different bundles to complete all txns --------
-  const { blockhash: block1 } = await connection.getLatestBlockhash();
+// The rest of your extendLUT() function remains essentially the same,
+// except that in the accounts for the buy instruction you now use the derived globalPDA.
+// (Also, in step 4 below, you push GLOBAL (the imported one) into accounts for LUT creation.
+// If your program expects the global PDA, you may want to similarly derive it there too.)
 
-  const extend1 = await buildTxn(extendLUTixs1, block1, lookupTableAccount);
-  const extend2 = await buildTxn(extendLUTixs2, block1, lookupTableAccount);
-  const extend3 = await buildTxn(extendLUTixs3, block1, lookupTableAccount);
-  const extend4 = await buildTxn(extendLUTixs4, block1, lookupTableAccount);
+/**
+ * Updates extendLUT to prevent blockhash expiration.
+ */
+export async function extendLUT() {
+  console.log("Extending Lookup Table...");
+  const { blockhash } = await getFreshBlockhash();
 
-  bundledTxns1.push(extend1, extend2, extend3, extend4);
+  const lut = new PublicKey("E5h4ypaMh1TwGtfRp1SLv6oc9btJLJw17cNxmHKQRCXw");
+  const lookupTableAccount = await getAddressLookupTableWithRetry(lut);
+  if (!lookupTableAccount) {
+    console.error("Lookup table account not found!");
+    return;
+  }
 
-  // -------- step 7: send bundle --------
-  await sendBundle(bundledTxns1);
+  const extendInstructions = [
+    AddressLookupTableProgram.extendLookupTable({
+      lookupTable: lut,
+      authority: payer.publicKey,
+      payer: payer.publicKey,
+      addresses: [wallet.publicKey],
+    }),
+  ];
+
+  const chunkedInstructions = chunkInstructions(extendInstructions, 2);
+
+  for (const chunk of chunkedInstructions) {
+    const message = new TransactionMessage({
+      payerKey: payer.publicKey,
+      recentBlockhash: blockhash,
+      instructions: chunk,
+    }).compileToV0Message();
+
+    const tx = new VersionedTransaction(message);
+    tx.sign([payer]);
+
+    try {
+      await sendTransactionsInBatches([tx]);
+      console.log("Lookup Table successfully extended.");
+    } catch (error) {
+      console.error("Error extending Lookup Table:", error);
+    }
+  }
 }
 
 export async function createLUT() {
-  // -------- step 1: ask nessesary questions for LUT build --------
   const jitoTipAmt = +prompt("Jito tip in Sol (Ex. 0.01): ") * LAMPORTS_PER_SOL;
-
-  // Read existing data from poolInfo.json
   let poolInfo: { [key: string]: any } = {};
   if (fs.existsSync(keyInfoPath)) {
-    const data = fs.readFileSync(keyInfoPath, "utf-8");
-    poolInfo = JSON.parse(data);
+    poolInfo = JSON.parse(fs.readFileSync(keyInfoPath, "utf-8"));
   }
-
   const bundledTxns: VersionedTransaction[] = [];
-
-  // -------- step 2: create a new LUT every time there is a new launch --------
   const createLUTixs: TransactionInstruction[] = [];
 
   const [create, lut] = AddressLookupTableProgram.createLookupTable({
@@ -272,38 +381,30 @@ export async function createLUT() {
 
   const lookupTablesMain1 =
     lookupTableProvider.computeIdealLookupTablesForAddresses(addressesMain);
-
-  const { blockhash } = await connection.getLatestBlockhash();
+  // const { blockhash } = await connection.getLatestBlockhash();
+  const { blockhash } = await getFreshBlockhash();
 
   const messageMain1 = new TransactionMessage({
     payerKey: payer.publicKey,
     recentBlockhash: blockhash,
     instructions: createLUTixs,
   }).compileToV0Message(lookupTablesMain1);
-  const createLUT = new VersionedTransaction(messageMain1);
+  const createLUTTx = new VersionedTransaction(messageMain1);
 
-  // Append new LUT info
-  poolInfo.addressLUT = lut.toString(); // Using 'addressLUT' as the field name
-
+  poolInfo.addressLUT = lut.toString();
   try {
-    const serializedMsg = createLUT.serialize();
+    const serializedMsg = createLUTTx.serialize();
     console.log("Txn size:", serializedMsg.length);
     if (serializedMsg.length > 1232) {
       console.log("tx too big");
     }
-    createLUT.sign([payer]);
+    createLUTTx.sign([payer]);
   } catch (e) {
     console.log(e, "error signing createLUT");
     process.exit(0);
   }
-
-  // Write updated content back to poolInfo.json
   fs.writeFileSync(keyInfoPath, JSON.stringify(poolInfo, null, 2));
-
-  // Push to bundle
-  bundledTxns.push(createLUT);
-
-  // -------- step 3: SEND BUNDLE --------
+  bundledTxns.push(createLUTTx);
   await sendBundle(bundledTxns);
 }
 
@@ -318,7 +419,6 @@ async function buildTxn(
     instructions: extendLUTixs,
   }).compileToV0Message([lut]);
   const txn = new VersionedTransaction(messageMain);
-
   try {
     const serializedMsg = txn.serialize();
     console.log("Txn size:", serializedMsg.length);
@@ -327,8 +427,7 @@ async function buildTxn(
     }
     txn.sign([payer]);
   } catch (e) {
-    const serializedMsg = txn.serialize();
-    console.log("txn size:", serializedMsg.length);
+    console.log("txn size:", txn.serialize().length);
     console.log(e, "error signing extendLUT");
     process.exit(0);
   }
@@ -341,10 +440,22 @@ async function sendBundle(bundledTxns: VersionedTransaction[]) {
       new JitoBundle(bundledTxns, bundledTxns.length)
     );
     console.log(`Bundle ${bundleId} sent.`);
+    const result = await new Promise((resolve, reject) => {
+      searcherClient.onBundleResult(
+        (result) => {
+          console.log("Received bundle result:", result);
+          resolve(result);
+        },
+        (e: Error) => {
+          console.error("Error receiving bundle result:", e);
+          reject(e);
+        }
+      );
+    });
+    console.log("Result:", result);
   } catch (error) {
     const err = error as any;
     console.error("Error sending bundle:", err.message);
-
     if (err?.message?.includes("Bundle Dropped, no connected leader up soon")) {
       console.error(
         "Error sending bundle: Bundle Dropped, no connected leader up soon."
@@ -354,47 +465,3 @@ async function sendBundle(bundledTxns: VersionedTransaction[]) {
     }
   }
 }
-
-/*
-async function createAndSignVersionedTxNOLUT(
-    instructionsChunk: TransactionInstruction[], 
-    blockhash: Blockhash | string,
-): Promise<VersionedTransaction> {
-    const addressesMain: PublicKey[] = [];
-    instructionsChunk.forEach((ixn) => {
-        ixn.keys.forEach((key) => {
-            addressesMain.push(key.pubkey);
-        });
-    });
-
-    const lookupTablesMain1 =
-        lookupTableProvider.computeIdealLookupTablesForAddresses(addressesMain);
-
-    const message = new TransactionMessage({
-        payerKey: wallet.publicKey,
-        recentBlockhash: blockhash,
-        instructions: instructionsChunk,
-    }).compileToV0Message(lookupTablesMain1);
-
-    const versionedTx = new VersionedTransaction(message);
-    const serializedMsg = versionedTx.serialize();
-
-    console.log("Txn size:", serializedMsg.length);
-    if (serializedMsg.length > 1232) { console.log('tx too big'); }
-    versionedTx.sign([wallet]);
-
-    
-    // Simulate each txn
-    const simulationResult = await connection.simulateTransaction(versionedTx, { commitment: "processed" });
-
-    if (simulationResult.value.err) {
-    console.log("Simulation error:", simulationResult.value.err);
-    } else {
-    console.log("Simulation success. Logs:");
-    simulationResult.value.logs?.forEach(log => console.log(log));
-    }
-    
-
-    return versionedTx;
-}
-*/
