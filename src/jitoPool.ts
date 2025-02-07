@@ -133,6 +133,17 @@ export async function buyBundle() {
     [Buffer.from("bonding-curve"), mintKp.publicKey.toBytes()],
     program.programId
   );
+
+  // 2. Derive the associatedBondingCurve account:
+  const [associatedBondingCurve] = PublicKey.findProgramAddressSync(
+    [
+      bondingCurve.toBytes(),
+      spl.TOKEN_PROGRAM_ID.toBytes(),
+      mintKp.publicKey.toBytes(),
+    ],
+    spl.ASSOCIATED_TOKEN_PROGRAM_ID
+  );
+
   const [metadata] = PublicKey.findProgramAddressSync(
     [
       Buffer.from("metadata"),
@@ -141,19 +152,20 @@ export async function buyBundle() {
     ],
     MPL_TOKEN_METADATA_PROGRAM_ID
   );
-
-  const account1 = mintKp.publicKey;
-  const account2 = mintAuthority;
-  const account3 = bondingCurve;
-  const account5 = global;
-  const account6 = MPL_TOKEN_METADATA_PROGRAM_ID;
-  const account7 = metadata;
+  // 5. Set the user to be the wallet creating the pool:
+  const user = wallet; // or use another keypair if appropriate
 
   const createIx = await program.methods
     .create(name, symbol, metadata_uri)
     .accounts({
-      mint: account1,
-      mintAuthority: account2,
+      mint: mintKp.publicKey,
+      mintAuthority,
+      bondingCurve,
+      associatedBondingCurve,
+      global: global,
+      mplTokenMetadata: MPL_TOKEN_METADATA_PROGRAM_ID, // using the constant as provided in your config
+      metadata, // using the derived PDA
+      user: user.publicKey,
       systemProgram: SystemProgram.programId,
       tokenProgram: spl.TOKEN_PROGRAM_ID,
       associatedTokenProgram: spl.ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -175,6 +187,13 @@ export async function buyBundle() {
     mintKp.publicKey
   );
 
+  // ––– Now, update the Buy Instruction with all required accounts –––
+  // Derive the user's associated token account for the mint.
+  const associatedUser = await spl.getAssociatedTokenAddress(
+    mintKp.publicKey,
+    wallet.publicKey
+  );
+
   // Extract tokenAmount from keyInfo for this keypair
   const keypairInfo = keyInfo[wallet.publicKey.toString()];
   if (!keypairInfo) {
@@ -190,10 +209,17 @@ export async function buyBundle() {
   const buyIx = await program.methods
     .buy(amount, solAmount)
     .accounts({
+      global: global, // Global account from config
+      feeRecipient: feeRecipient, // From config
+      mint: mintKp.publicKey, // The token mint
+      bondingCurve: bondingCurve, // Derived PDA
+      associatedBondingCurve: associatedBondingCurve, // Derived PDA
+      associatedUser: associatedUser, // User's ATA for the mint
+      user: wallet.publicKey, // The buyer
       systemProgram: SystemProgram.programId,
       tokenProgram: spl.TOKEN_PROGRAM_ID,
       rent: SYSVAR_RENT_PUBKEY,
-      eventAuthority,
+      eventAuthority: eventAuthority,
       program: PUMP_PROGRAM,
     })
     .instruction();
@@ -255,47 +281,46 @@ export async function buyBundle() {
 
 async function createWalletSwaps(
   blockhash: string,
-  keypairs: Keypair[],
-  lut: AddressLookupTableAccount,
-  // bondingCurve: PublicKey,
-  // associatedBondingCurve: PublicKey,
+  keypairs: any[], // array of Keypair objects
+  lut: any, // AddressLookupTableAccount
   mint: PublicKey,
-  program: Program
+  program: any // Anchor Program instance
 ): Promise<VersionedTransaction[]> {
   const txsSigned: VersionedTransaction[] = [];
   const chunkedKeypairs = chunkArray(keypairs, 6);
 
-  // Load keyInfo data from JSON file
+  // Load key info from file
   let keyInfo: {
-    [key: string]: {
+    [pubkey: string]: {
       solAmount: number;
       tokenAmount: string;
       percentSupply: number;
     };
   } = {};
   if (fs.existsSync(keyInfoPath)) {
-    const existingData = fs.readFileSync(keyInfoPath, "utf-8");
-    keyInfo = JSON.parse(existingData);
+    try {
+      const existingData = fs.readFileSync(keyInfoPath, "utf-8");
+      keyInfo = JSON.parse(existingData);
+    } catch (e) {
+      console.error("Error parsing keyInfo.json:", e);
+    }
   }
 
-  // Iterate over each chunk of keypairs
+  // Process each chunk of keypairs
   for (let chunkIndex = 0; chunkIndex < chunkedKeypairs.length; chunkIndex++) {
     const chunk = chunkedKeypairs[chunkIndex];
     const instructionsForChunk: TransactionInstruction[] = [];
 
-    // Iterate over each keypair in the chunk to create swap instructions
     for (let i = 0; i < chunk.length; i++) {
       const keypair = chunk[i];
-      console.log(
-        `Processing keypair ${i + 1}/${chunk.length}:`,
-        keypair.publicKey.toString()
-      );
+      const pubkeyStr = keypair.publicKey.toString();
+      console.log(`Processing keypair ${i + 1}/${chunk.length}: ${pubkeyStr}`);
 
+      // Create the associated token account instruction
       const ataAddress = await spl.getAssociatedTokenAddress(
         mint,
         keypair.publicKey
       );
-
       const createTokenAta =
         spl.createAssociatedTokenAccountIdempotentInstruction(
           payer.publicKey,
@@ -304,66 +329,77 @@ async function createWalletSwaps(
           mint
         );
 
-      // Extract tokenAmount from keyInfo for this keypair
-      const keypairInfo = keyInfo[keypair.publicKey.toString()];
+      // Extract key info for this keypair
+      const keypairInfo = keyInfo[pubkeyStr];
       if (!keypairInfo) {
+        console.log(`No key info found for keypair: ${pubkeyStr}, skipping.`);
+        continue; // Skip processing this keypair if no info is available
+      }
+      if (!keypairInfo.tokenAmount || !keypairInfo.solAmount) {
         console.log(
-          `No key info found for keypair: ${keypair.publicKey.toString()}`
+          `Incomplete key info for ${pubkeyStr} (missing tokenAmount or solAmount), skipping.`
         );
         continue;
       }
 
-      // Calculate SOL amount based on tokenAmount
+      // Calculate parameters using the saved key info
       const amount = new BN(keypairInfo.tokenAmount);
       const solAmount = new BN(
         100000 * keypairInfo.solAmount * LAMPORTS_PER_SOL
       );
 
-      const buyIx = await program.methods
-        .buy(amount, solAmount)
-        .accounts({
-          systemProgram: SystemProgram.programId,
-          tokenProgram: spl.TOKEN_PROGRAM_ID,
-          rent: SYSVAR_RENT_PUBKEY,
-          eventAuthority,
-          program: PUMP_PROGRAM,
-        })
-        .instruction();
+      // Build the buy instruction via the Anchor program
+      let buyIx: TransactionInstruction;
+      try {
+        buyIx = await program.methods
+          .buy(amount, solAmount)
+          .accounts({
+            systemProgram: SystemProgram.programId,
+            tokenProgram: spl.TOKEN_PROGRAM_ID,
+            rent: SYSVAR_RENT_PUBKEY,
+            eventAuthority,
+            program: PUMP_PROGRAM,
+          })
+          .instruction();
+      } catch (err) {
+        console.error(`Error creating buy instruction for ${pubkeyStr}:`, err);
+        continue;
+      }
 
+      // Push both instructions for this keypair into the instructions list
       instructionsForChunk.push(createTokenAta, buyIx);
     }
 
-    const message = new TransactionMessage({
-      payerKey: payer.publicKey,
-      recentBlockhash: blockhash,
-      instructions: instructionsForChunk,
-    }).compileToV0Message([lut]);
+    if (instructionsForChunk.length > 0) {
+      // Compile the instructions into a versioned transaction using the provided LUT
+      const message = new TransactionMessage({
+        payerKey: payer.publicKey,
+        recentBlockhash: blockhash,
+        instructions: instructionsForChunk,
+      }).compileToV0Message([lut]);
 
-    const serializedMsg = message.serialize();
-    console.log("Txn size:", serializedMsg.length);
-    if (serializedMsg.length > 1232) {
-      console.log("tx too big");
-    }
-
-    const versionedTx = new VersionedTransaction(message);
-
-    console.log(
-      "Signing transaction with chunk signers",
-      chunk.map((kp) => kp.publicKey.toString())
-    );
-
-    // Sign with the wallet for tip on the last instruction
-    for (const kp of chunk) {
-      if (kp.publicKey.toString() in keyInfo) {
-        versionedTx.sign([kp]);
+      const serializedMsg = message.serialize();
+      console.log("Txn size:", serializedMsg.length);
+      if (serializedMsg.length > 1232) {
+        console.log("Warning: Transaction size is too big.");
       }
+
+      const versionedTx = new VersionedTransaction(message);
+
+      // Sign with each keypair in the chunk that has key info
+      console.log(
+        "Signing transaction with chunk signers:",
+        chunk.map((kp) => kp.publicKey.toString())
+      );
+      for (const kp of chunk) {
+        if (keyInfo[kp.publicKey.toString()]) {
+          versionedTx.sign([kp]);
+        }
+      }
+      versionedTx.sign([payer]);
+      txsSigned.push(versionedTx);
     }
-
-    versionedTx.sign([payer]);
-
-    txsSigned.push(versionedTx);
   }
-
   return txsSigned;
 }
 
