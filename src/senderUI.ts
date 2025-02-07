@@ -9,7 +9,12 @@ import {
   Blockhash,
 } from "@solana/web3.js";
 import { loadKeypairs } from "./createKeys";
-import { wallet, connection, payer } from "../config";
+import {
+  wallet,
+  connection,
+  payer,
+  getAddressLookupTableWithRetry,
+} from "../config";
 import {
   TOKEN_PROGRAM_ID,
   createCloseAccountInstruction,
@@ -274,8 +279,8 @@ async function getLUTWithRetry(
 ) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await connection.getAddressLookupTable(lutPublicKey);
-      if (response.value) return response.value;
+      const response = await getAddressLookupTableWithRetry(lutPublicKey);
+      if (response) return response;
     } catch (err) {
       console.warn(`Attempt ${attempt} failed: ${err}`);
       if (attempt < retries) {

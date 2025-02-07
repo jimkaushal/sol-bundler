@@ -1,4 +1,11 @@
-import { connection, rpc, wallet, payer, RayLiqPoolv4 } from "../config";
+import {
+  connection,
+  rpc,
+  wallet,
+  payer,
+  RayLiqPoolv4,
+  getAddressLookupTableWithRetry,
+} from "../config";
 import {
   PublicKey,
   VersionedTransaction,
@@ -101,8 +108,7 @@ export async function sellXPercentageRAY() {
 
   const lut = new PublicKey(poolInfo.addressLUT.toString());
 
-  const lookupTableAccount = (await connection.getAddressLookupTable(lut))
-    .value;
+  const lookupTableAccount = await getAddressLookupTableWithRetry(lut);
 
   if (lookupTableAccount == null) {
     console.log("Lookup table account not found!4");

@@ -9,6 +9,7 @@ import {
   mintAuthority,
   rpc,
   payer,
+  getAddressLookupTableWithRetry,
 } from "../config";
 import {
   PublicKey,
@@ -64,8 +65,7 @@ export async function buyBundle() {
 
   const lut = new PublicKey(keyInfo.addressLUT.toString());
 
-  const lookupTableAccount = (await connection.getAddressLookupTable(lut))
-    .value;
+  const lookupTableAccount = await getAddressLookupTableWithRetry(lut);
 
   if (lookupTableAccount == null) {
     console.log("Lookup table account not found!2");

@@ -13,7 +13,13 @@ import {
 } from "@solana/web3.js";
 import fs from "fs";
 import path from "path";
-import { wallet, connection, PUMP_PROGRAM, payer } from "../config";
+import {
+  wallet,
+  connection,
+  PUMP_PROGRAM,
+  payer,
+  getAddressLookupTableWithRetry,
+} from "../config";
 import promptSync from "prompt-sync";
 import { searcherClient } from "./clients/jito";
 import { Bundle as JitoBundle } from "jito-ts/dist/sdk/block-engine/types.js";
@@ -59,8 +65,8 @@ export async function extendLUT() {
   const accounts: PublicKey[] = []; // Array with all new keys to push to the new LUT
   const lut = new PublicKey(poolInfo.addressLUT.toString());
   console.log("LUT address: ", lut.toString());
-  const lookupTableAccount = (await connection.getAddressLookupTable(lut))
-    .value;
+
+  const lookupTableAccount = await getAddressLookupTableWithRetry(lut); // Fetch the lookup table account with retries)
 
   if (lookupTableAccount == null) {
     console.log("Lookup table account not found!1");

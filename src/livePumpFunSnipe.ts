@@ -6,7 +6,7 @@ import {
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
 import promptSync from "prompt-sync";
-import { connection, payer } from "../config";
+import { connection, payer, getAddressLookupTableWithRetry } from "../config";
 import { loadKeypairs } from "./createKeys";
 import { getMint, Mint } from "@solana/spl-token";
 import fs from "fs";
@@ -35,15 +35,13 @@ async function getLUTAccount(): Promise<any | null> {
       return null;
     }
     const lutPubkey = new PublicKey(data.addressLUT);
-    const lutAccountResponse = await connection.getAddressLookupTable(
-      lutPubkey
-    );
-    if (!lutAccountResponse.value) {
+    const lutAccountResponse = await getAddressLookupTableWithRetry(lutPubkey);
+    if (!lutAccountResponse) {
       console.log("LUT account not found on chain.");
       return null;
     }
     console.log("LUT account loaded:", lutPubkey.toString());
-    return lutAccountResponse.value;
+    return lutAccountResponse;
   } catch (err) {
     console.error("Error loading LUT account:", err);
     return null;
